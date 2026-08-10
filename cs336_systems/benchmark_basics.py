@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import pandas as pd
 import logging
 from statistics import mean, stdev
-import torch.cuda.nvtx as nvtx
+import nvtx
 
 logging.basicConfig(
     format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
@@ -103,7 +103,7 @@ def benchmark(
             pass
 
     def step_forward():
-        with nvtx.range("forward"):
+        with nvtx.annotate("forward", domain="benchmark", color="green"):
             with torch.no_grad():
                 start = timeit.default_timer()
                 _ = model(x)
@@ -114,28 +114,28 @@ def benchmark(
         optimizer.zero_grad()
         start = timeit.default_timer()
 
-        with nvtx.range("forward"):
+        with nvtx.annotate("forward", domain="benchmark", color="green"):
             out: torch.Tensor = model(x)
             sync()
 
         forward_time = timeit.default_timer()
         forward_takes = (forward_time - start) * 1000
 
-        with nvtx.range("loss"):
+        with nvtx.annotate("loss", domain="benchmark", color="yellow"):
             loss: torch.Tensor = lossfn(out.view(-1, vocab_size), y.view(-1))
             sync()
 
         loss_time = timeit.default_timer()
         loss_takes = (loss_time - forward_time) * 1000
 
-        with nvtx.range("loss"):
+        with nvtx.annotate("backward", domain="benchmark", color="red"):
             loss.backward()
             sync()
 
         backward_time = timeit.default_timer()
         backward_takes = (backward_time - loss_time) * 1000
 
-        with nvtx.range("loss"):
+        with nvtx.annotate("optimizer", domain="benchmark", color="purple"):
             optimizer.step()
             sync()
 
@@ -183,7 +183,11 @@ def benchmark(
             group["lr"] = lr
         try:
             if step == 0:
-                with nvtx.range("profile_step"):
+                with nvtx.annotate(
+                    "profile_step",
+                    domain="benchmark",
+                    color="blue",
+                ):
                     time_spend = step_fn()
             else:
                 time_spend = step_fn()
