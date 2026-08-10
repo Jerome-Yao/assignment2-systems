@@ -1,6 +1,6 @@
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW, get_cosine_lr
-import torch 
+import torch
 import torch.nn as nn
 import torch.amp
 import timeit
@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import pandas as pd
 import logging
 from statistics import mean, stdev
+import torch.cuda.nvtx as nvtx
 
 logging.basicConfig(
     format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
@@ -102,32 +103,42 @@ def benchmark(
             pass
 
     def step_forward():
-        with torch.no_grad():
-            start = timeit.default_timer()
-            _ = model(x)
-            forward_takes = (timeit.default_timer() - start) * 1000
-            return {"forward_takes": forward_takes, "total_takes": forward_takes}
+        with nvtx.range("forward"):
+            with torch.no_grad():
+                start = timeit.default_timer()
+                _ = model(x)
+                forward_takes = (timeit.default_timer() - start) * 1000
+                return {"forward_takes": forward_takes, "total_takes": forward_takes}
 
     def step_forward_and_backward():
         optimizer.zero_grad()
         start = timeit.default_timer()
-        out: torch.Tensor = model(x)
-        sync()
+
+        with nvtx.range("forward"):
+            out: torch.Tensor = model(x)
+            sync()
+
         forward_time = timeit.default_timer()
         forward_takes = (forward_time - start) * 1000
 
-        loss: torch.Tensor = lossfn(out.view(-1, vocab_size), y.view(-1))
-        sync()
-        loss_time = timeit.default_timer()
-        loss_takes = loss_time - forward_time
+        with nvtx.range("loss"):
+            loss: torch.Tensor = lossfn(out.view(-1, vocab_size), y.view(-1))
+            sync()
 
-        loss.backward()
-        sync()
+        loss_time = timeit.default_timer()
+        loss_takes = (loss_time - forward_time) * 1000
+
+        with nvtx.range("loss"):
+            loss.backward()
+            sync()
+
         backward_time = timeit.default_timer()
         backward_takes = (backward_time - loss_time) * 1000
 
-        optimizer.step()
-        sync()
+        with nvtx.range("loss"):
+            optimizer.step()
+            sync()
+
         optimizer_time = timeit.default_timer()
         optimizer_takes = (optimizer_time - backward_time) * 1000
         total_takes = (optimizer_time - start) * 1000
@@ -171,7 +182,10 @@ def benchmark(
         for group in optimizer.param_groups:
             group["lr"] = lr
         try:
-            with ctx:
+            if step == 0:
+                with nvtx.range("profile_step"):
+                    time_spend = step_fn()
+            else:
                 time_spend = step_fn()
         except torch.cuda.OutOfMemoryError as e:
             logging.error("train step_%s mode %s CUDA OOM: %s", step, mode, e)
