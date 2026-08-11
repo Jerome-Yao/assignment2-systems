@@ -12,6 +12,7 @@ import torch.nn as nn
 from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import nvtx
 
 from cs336_basics.nn_utils import softmax
 
@@ -32,7 +33,10 @@ class Linear(nn.Module):
         super().__init__()
         std = math.sqrt(2 / (d_in + d_out))
         self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std), requires_grad=True
+            nn.init.trunc_normal_(
+                torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std
+            ),
+            requires_grad=True,
         )
 
     def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
@@ -47,7 +51,10 @@ class Embedding(nn.Module):
         super().__init__()
         std = 1.0
         self.weight = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std), requires_grad=True
+            nn.init.trunc_normal_(
+                torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std
+            ),
+            requires_grad=True,
         )
 
     def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
@@ -111,12 +118,16 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, context_length: int, dim: int, theta: float = 10000.0):
         super().__init__()
         self.register_buffer(
-            "_freq_cis_cache", RotaryEmbedding._init_cache(context_length, dim, theta), persistent=False
+            "_freq_cis_cache",
+            RotaryEmbedding._init_cache(context_length, dim, theta),
+            persistent=False,
         )
         self._freq_cis_cache: Float[Tensor, "2 context_length half_dim"]
 
     @staticmethod
-    def _init_cache(context_length: int, dim: int, theta: float) -> Float[Tensor, " 2 context_length half_dim"]:
+    def _init_cache(
+        context_length: int, dim: int, theta: float
+    ) -> Float[Tensor, " 2 context_length half_dim"]:
         assert dim % 2 == 0
 
         d = torch.arange(0, dim, 2) / dim
@@ -138,7 +149,11 @@ class RotaryEmbedding(nn.Module):
 
         # einx
         if pos_ids is not None:
-            cos, sin = einx.get_at("cos_sin [pos] half_dim, ... -> cos_sin ... half_dim", self._freq_cis_cache, pos_ids)
+            cos, sin = einx.get_at(
+                "cos_sin [pos] half_dim, ... -> cos_sin ... half_dim",
+                self._freq_cis_cache,
+                pos_ids,
+            )
         else:
             seq_len = x.size(-2)
             cos, sin = self._freq_cis_cache[:, :seq_len, :].unbind(0)
@@ -189,7 +204,9 @@ class BasicsTransformerLM(nn.Module):
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
-            k: v for k, v in locals().items() if k != "self" and not (k.startswith("__") and k.endswith("__"))
+            k: v
+            for k, v in locals().items()
+            if k != "self" and not (k.startswith("__") and k.endswith("__"))
         }
         super().__init__()
         self.context_length = context_length
@@ -197,7 +214,9 @@ class BasicsTransformerLM(nn.Module):
         self.token_embeddings = Embedding(vocab_size, d_model)
         d_head = d_model // num_heads
         self.positional_encoder = (
-            RotaryEmbedding(context_length, d_head, rope_theta) if rope_theta is not None else None
+            RotaryEmbedding(context_length, d_head, rope_theta)
+            if rope_theta is not None
+            else None
         )
 
         self.layers = nn.ModuleList(
@@ -217,7 +236,9 @@ class BasicsTransformerLM(nn.Module):
         # matrix between the two embedding layers and the pre-softmax linear transformation"
         # self.lm_head.weight = self.token_embeddings.weight
         # report number of parameters
-        logger.info(f"number of non-embedding parameters: {self.get_num_params() / 1e6:.2f}M")
+        logger.info(
+            f"number of non-embedding parameters: {self.get_num_params() / 1e6:.2f}M"
+        )
 
     def get_num_params(self) -> int:
         """
@@ -229,7 +250,9 @@ class BasicsTransformerLM(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-    def forward(self, x: Int[Tensor, " ... sequence_length"]) -> Float[Tensor, " ... sequence_length vocab_size"]:
+    def forward(
+        self, x: Int[Tensor, " ... sequence_length"]
+    ) -> Float[Tensor, " ... sequence_length vocab_size"]:
         """
         Args:
             x: Input IDs for language modeling.
@@ -303,8 +326,12 @@ class BasicsTransformerLM(nn.Module):
                 # Get the score of the kth item that we kept---items with lower scores should be masked.
                 threshold = topk_values[:, -1]
                 topk_mask = temperature_scaled_next_token_logits < threshold
-                temperature_scaled_next_token_logits.masked_fill(topk_mask, float("-inf"))
-            next_token_probabilities = softmax(temperature_scaled_next_token_logits, dim=-1)
+                temperature_scaled_next_token_logits.masked_fill(
+                    topk_mask, float("-inf")
+                )
+            next_token_probabilities = softmax(
+                temperature_scaled_next_token_logits, dim=-1
+            )
             next_token_id = torch.multinomial(next_token_probabilities, 1)
             # End generation if we see the EOS token ID
             if eos_token_id is not None and next_token_id.item() == eos_token_id:
@@ -424,14 +451,44 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+    with nvtx.annotate(
+        "attention_qk_matmul",
+        domain="attention",
+        color="blue",
+    ):
+        attention_scores = einsum(
+            Q, K, "... query d_k, ... key d_k -> ... query key"
+        ) / math.sqrt(d_k)
 
-    if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    with nvtx.annotate(
+        "attention_mask",
+        domain="attention",
+        color="gray",
+    ):
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with nvtx.annotate(
+        "attention_softmax",
+        domain="attention",
+        color="yellow",
+    ):
+        attention_weights = softmax(
+            attention_scores, dim=-1
+        )  # Softmax over the key dimension
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    with nvtx.annotate(
+        "attention_value_matmul",
+        domain="attention",
+        color="green",
+    ):
+        output = einsum(
+            attention_weights,
+            V,
+            "... query key, ... key d_v -> ... query d_v",
+        )
+
+    return output
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
@@ -478,7 +535,9 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self.positional_encoder: RotaryEmbedding | None = positional_encoder  # RoPE
 
     def forward(
-        self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None
+        self,
+        x: Float[Tensor, " ... seq d_k"],
+        token_positions: Int[Tensor, " ... seq"] | None = None,
     ) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:
@@ -514,14 +573,18 @@ class CausalMultiHeadSelfAttention(nn.Module):
         qi = rearrange(iota, "query -> query 1")
         kj = rearrange(iota, "key   -> 1   key")
         causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
+        causal_mask = causal_mask.__getitem__(
+            (None,) * len(batch_dims) + (...,)
+        )  # Add appropriate leading dimensions
 
         # Shape: (..., num_heads, sequence_length, d_k)
         attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
+        attn_output = rearrange(
+            attn_output, "batch heads seq d_v -> batch seq (heads d_v)"
+        ).contiguous()
 
         # Apply the output projection
         output = self.output_proj(attn_output)
