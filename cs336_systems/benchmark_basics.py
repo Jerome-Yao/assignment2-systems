@@ -1,7 +1,6 @@
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW, get_cosine_lr
 import torch
-import torch.nn as nn
 import torch.amp
 import timeit
 from contextlib import nullcontext
@@ -74,7 +73,7 @@ def benchmark(
     mode,
     model_type,
     context_length,
-    mixed_precision=False,
+    mixed_precision=True,
 ):
     logging.info(
         f"start run model: {model_type}, mode: {mode}, context_length: {context_length}, mixed_precision: {mixed_precision}"
@@ -88,11 +87,12 @@ def benchmark(
     global_step = 0
     lossfn = torch.nn.CrossEntropyLoss()
 
-    ctx = (
-        torch.amp.autocast(device, dtype=torch.bfloat16)
-        if mixed_precision
-        else nullcontext()
-    )
+    def precision_context():
+        return (
+            torch.amp.autocast(device, dtype=torch.bfloat16)
+            if mixed_precision
+            else nullcontext()
+        )
 
     def sync():
         if device == "cuda":
@@ -106,7 +106,9 @@ def benchmark(
         with nvtx.annotate("forward", domain="benchmark", color="green"):
             with torch.no_grad():
                 start = timeit.default_timer()
-                _ = model(x)
+                with precision_context():
+                    _ = model(x)
+                sync()
                 forward_takes = (timeit.default_timer() - start) * 1000
                 return {"forward_takes": forward_takes, "total_takes": forward_takes}
 
@@ -114,16 +116,17 @@ def benchmark(
         optimizer.zero_grad()
         start = timeit.default_timer()
 
-        with nvtx.annotate("forward", domain="benchmark", color="green"):
-            out: torch.Tensor = model(x)
-            sync()
+        with precision_context():
+            with nvtx.annotate("forward", domain="benchmark", color="green"):
+                out: torch.Tensor = model(x)
+                sync()
 
-        forward_time = timeit.default_timer()
-        forward_takes = (forward_time - start) * 1000
+            forward_time = timeit.default_timer()
+            forward_takes = (forward_time - start) * 1000
 
-        with nvtx.annotate("loss", domain="benchmark", color="yellow"):
-            loss: torch.Tensor = lossfn(out.view(-1, vocab_size), y.view(-1))
-            sync()
+            with nvtx.annotate("loss", domain="benchmark", color="yellow"):
+                loss: torch.Tensor = lossfn(out.view(-1, vocab_size), y.view(-1))
+                sync()
 
         loss_time = timeit.default_timer()
         loss_takes = (loss_time - forward_time) * 1000
@@ -163,8 +166,7 @@ def benchmark(
         for group in optimizer.param_groups:
             group["lr"] = lr
         try:
-            with ctx:
-                time_spend = step_fn()
+            time_spend = step_fn()
         except Exception as e:
             logging.error(e)
             raise
